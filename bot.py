@@ -445,3 +445,915 @@ action="/reject/{{ w['id'] }}"
 </body>
 </html>
 """
+# ==============================
+# APPROVE WITHDRAWAL
+# ==============================
+
+@web_app.route("/approve/<int:withdrawal_id>", methods=["POST"])
+def approve_withdrawal(withdrawal_id):
+
+    if not session.get("admin_logged_in"):
+        return redirect("/login")
+
+    amount = request.form.get("amount", "").strip()
+
+    if not amount:
+        return redirect("/admin")
+
+    try:
+        amount = float(amount)
+    except ValueError:
+        return redirect("/admin")
+
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE withdrawals
+        SET payment_amount = ?,
+            status = 'Paid'
+        WHERE id = ?
+          AND status = 'Pending'
+        """,
+        (amount, withdrawal_id)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return redirect("/admin")
+
+
+# ==============================
+# REJECT WITHDRAWAL
+# ==============================
+
+@web_app.route("/reject/<int:withdrawal_id>", methods=["POST"])
+def reject_withdrawal(withdrawal_id):
+
+    if not session.get("admin_logged_in"):
+        return redirect("/login")
+
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT telegram_id, coins
+        FROM withdrawals
+        WHERE id = ?
+          AND status = 'Pending'
+        """,
+        (withdrawal_id,)
+    )
+
+    withdrawal = cursor.fetchone()
+
+    if withdrawal:
+
+        cursor.execute(
+            """
+            UPDATE users
+            SET coins = coins + ?
+            WHERE telegram_id = ?
+            """,
+            (
+                withdrawal["coins"],
+                withdrawal["telegram_id"]
+            )
+        )
+
+        cursor.execute(
+            """
+            UPDATE withdrawals
+            SET status = 'Rejected'
+            WHERE id = ?
+            """,
+            (withdrawal_id,)
+        )
+
+        conn.commit()
+
+    conn.close()
+
+    return redirect("/admin")
+    # ==============================
+# TELEGRAM USER FUNCTIONS
+# ==============================
+
+def get_user(telegram_id):
+
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT * FROM users WHERE telegram_id = ?",
+        (telegram_id,)
+    )
+
+    user = cursor.fetchone()
+
+    conn.close()
+
+    return user
+
+
+def create_user(update, referred_by=None):
+
+    user = update.effective_user
+
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT telegram_id FROM users WHERE telegram_id = ?",
+        (user.id,)
+    )
+
+    exists = cursor.fetchone()
+
+    if not exists:
+
+        valid_referrer = None
+
+        if referred_by and referred_by != user.id:
+
+            cursor.execute(
+                "SELECT telegram_id FROM users WHERE telegram_id = ?",
+                (referred_by,)
+            )
+
+            referrer = cursor.fetchone()
+
+            if referrer:
+                valid_referrer = referred_by
+
+        cursor.execute(
+            """
+            INSERT INTO users
+            (
+                telegram_id,
+                username,
+                first_name,
+                referred_by,
+                referrals,
+                coins
+            )
+            VALUES (?, ?, ?, ?, 0, 0)
+            """,
+            (
+                user.id,
+                user.username or "",
+                user.first_name or "",
+                valid_referrer
+            )
+        )
+
+        if valid_referrer:
+
+            cursor.execute(
+                """
+                UPDATE users
+                SET referrals = referrals + 1,
+                    coins = coins + ?
+                WHERE telegram_id = ?
+                """,
+                (
+                    REFERRAL_BONUS,
+                    valid_referrer
+                )
+            )
+
+    else:
+
+        cursor.execute(
+            """
+            UPDATE users
+            SET username = ?,
+                first_name = ?
+            WHERE telegram_id = ?
+            """,
+            (
+                user.username or "",
+                user.first_name or "",
+                user.id
+            )
+        )
+
+    conn.commit()
+    conn.close()
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+    referred_by = None
+
+    if context.args:
+
+        try:
+            referred_by = int(context.args[0])
+        except ValueError:
+            referred_by = None
+
+    create_user(
+        update,
+        referred_by
+    )
+
+    keyboard = [
+
+        [
+            InlineKeyboardButton(
+                "🤖 AI-কে প্রশ্ন করুন",
+                callback_data="ai"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💰 ইনকামের মাধ্যম",
+                callback_data="income"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🎁 Affiliate Offers",
+                callback_data="offers"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📢 Ads / Direct Link",
+                callback_data="ads"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🪙 আমার Coins",
+                callback_data="coins"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "🔗 Referral Link",
+                callback_data="referral"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💳 Withdraw",
+                callback_data="withdraw"
+            )
+        ]
+
+    ]
+
+    await update.message.reply_text(
+
+        "👋 স্বাগতম EarnMate AI Bot-এ!\n\n"
+        "🪙 Referral করে Coins সংগ্রহ করুন।\n"
+        "প্রতি সফল Referral = 100 Coins\n\n"
+        "নিচের মেনু থেকে একটি অপশন নির্বাচন করুন।",
+
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        )
+        )# ==============================
+# COINS / REFERRAL / WITHDRAW
+# ==============================
+
+async def show_coins(update, context):
+
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    user = get_user(user_id)
+
+    coins = user["coins"] if user else 0
+    referrals = user["referrals"] if user else 0
+
+    await query.message.reply_text(
+        f"🪙 আপনার Coins: {coins}\n\n"
+        f"👥 আপনার Referral: {referrals} জন\n\n"
+        "প্রতি সফল Referral = 100 Coins"
+    )
+
+
+async def show_referral(update, context):
+
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    bot = await context.bot.get_me()
+
+    referral_link = (
+        f"https://t.me/{bot.username}"
+        f"?start={user_id}"
+    )
+
+    user = get_user(user_id)
+
+    referrals = user["referrals"] if user else 0
+
+    await query.message.reply_text(
+        "🔗 আপনার Referral Link:\n\n"
+        f"{referral_link}\n\n"
+        f"👥 আপনার Referral: {referrals} জন\n\n"
+        "এই লিংক শেয়ার করে নতুন User আনতে পারবেন।"
+    )
+
+
+async def start_withdraw(update, context):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    keyboard = [
+
+        [
+            InlineKeyboardButton(
+                "💳 bKash",
+                callback_data="withdraw_bkash"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💳 Nagad",
+                callback_data="withdraw_nagad"
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "💳 Rocket",
+                callback_data="withdraw_rocket"
+            )
+        ]
+
+    ]
+
+    await query.message.reply_text(
+        "💳 Withdrawal\n\n"
+        "আপনার Payment Method নির্বাচন করুন:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def choose_withdraw_method(update, context):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    method = query.data.replace(
+        "withdraw_",
+        ""
+    )
+
+    context.user_data["withdraw_method"] = method
+
+    context.user_data["withdraw_step"] = "coins"
+
+    await query.message.reply_text(
+        "🪙 কত Coins উত্তোলন করতে চান?\n\n"
+        "সর্বনিম্ন 5,000 Coins\n"
+        "সর্বোচ্চ 25,000 Coins\n\n"
+        "শুধু Coins-এর সংখ্যা লিখুন।"
+    )# ==============================
+# WITHDRAW FORM
+# ==============================
+
+async def process_withdraw(update, context):
+
+    if context.user_data.get("withdraw_step") != "coins":
+        return
+
+    text = update.message.text.strip()
+
+    try:
+        coins = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ শুধু Coins-এর সংখ্যা লিখুন।\n\n"
+            "উদাহরণ: 5000"
+        )
+        return
+
+    if coins < MIN_WITHDRAW:
+        await update.message.reply_text(
+            f"❌ 5,000 Coins-এর নিচে উত্তোলন করা যাবে না।\n\n"
+            f"আপনি লিখেছেন: {coins} Coins\n"
+            f"আরও {MIN_WITHDRAW - coins} Coins লাগবে।"
+        )
+        return
+
+    if coins > MAX_WITHDRAW:
+        await update.message.reply_text(
+            "❌ একবারে সর্বোচ্চ 25,000 Coins "
+            "উত্তোলন করা যাবে।"
+        )
+        return
+
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+
+    if not user or user["coins"] < coins:
+        await update.message.reply_text(
+            f"❌ আপনার পর্যাপ্ত Coins নেই।\n\n"
+            f"🪙 আপনার Coins: "
+            f"{user['coins'] if user else 0}\n"
+            f"🪙 আপনি চেয়েছেন: {coins}"
+        )
+        return
+
+    context.user_data["withdraw_coins"] = coins
+    context.user_data["withdraw_step"] = "number"
+
+    method = context.user_data.get(
+        "withdraw_method",
+        ""
+    )
+
+    method_name = {
+        "bkash": "bKash",
+        "nagad": "Nagad",
+        "rocket": "Rocket"
+    }.get(method, method)
+
+    await update.message.reply_text(
+        f"💳 Payment Method: {method_name}\n\n"
+        "📱 আপনার bKash/Nagad/Rocket নম্বর লিখুন:"
+    )
+
+
+async def process_withdraw_number(update, context):
+
+    if context.user_data.get("withdraw_step") != "number":
+        return
+
+    number = update.message.text.strip()
+
+    if not number.isdigit():
+        await update.message.reply_text(
+            "❌ সঠিক মোবাইল নম্বর লিখুন।"
+        )
+        return
+
+    if len(number) < 10 or len(number) > 15:
+        await update.message.reply_text(
+            "❌ সঠিক মোবাইল নম্বর লিখুন।"
+        )
+        return
+
+    context.user_data["withdraw_number"] = number
+    context.user_data["withdraw_step"] = "comment"
+
+    await update.message.reply_text(
+        "📝 Comment লিখুন:\n\n"
+        "যেমন: আমার পেমেন্টটি দ্রুত দেওয়ার অনুরোধ করছি।"
+    )
+
+
+async def process_withdraw_comment(update, context):
+
+    if context.user_data.get("withdraw_step") != "comment":
+        return
+
+    comment = update.message.text.strip()
+
+    if not comment:
+        comment = "No comment"
+
+    context.user_data["withdraw_comment"] = comment
+
+    coins = context.user_data.get(
+        "withdraw_coins"
+    )
+
+    method = context.user_data.get(
+        "withdraw_method"
+    )
+
+    number = context.user_data.get(
+        "withdraw_number"
+    )
+
+    method_name = {
+        "bkash": "bKash",
+        "nagad": "Nagad",
+        "rocket": "Rocket"
+    }.get(method, method)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📤 Request পাঠান",
+                callback_data="confirm_withdraw"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="cancel_withdraw"
+            )
+        ]
+    ]
+
+    await update.message.reply_text(
+        "🔎 Withdrawal Request\n\n"
+        f"🪙 Coins: {coins}\n"
+        f"💳 Method: {method_name}\n"
+        f"📱 Number: {number}\n"
+        f"📝 Comment: {comment}\n\n"
+        "সব তথ্য ঠিক থাকলে Request পাঠান।",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )# ==============================
+# CONFIRM WITHDRAWAL
+# ==============================
+
+async def confirm_withdraw(update, context):
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    coins = context.user_data.get("withdraw_coins")
+    method = context.user_data.get("withdraw_method")
+    number = context.user_data.get("withdraw_number")
+    comment = context.user_data.get(
+        "withdraw_comment",
+        ""
+    )
+
+    if not coins or not method or not number:
+        await query.message.reply_text(
+            "❌ Withdrawal তথ্য পাওয়া যায়নি। "
+            "আবার চেষ্টা করুন।"
+        )
+        return
+
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # আবার Balance যাচাই
+    cursor.execute(
+        "SELECT coins FROM users WHERE telegram_id = ?",
+        (user_id,)
+    )
+
+    user = cursor.fetchone()
+
+    if not user or user["coins"] < coins:
+        conn.close()
+
+        await query.message.reply_text(
+            "❌ আপনার পর্যাপ্ত Coins নেই।"
+        )
+        return
+
+    # Request তৈরি + Coins একসাথে কেটে নেওয়া
+    cursor.execute(
+        """
+        UPDATE users
+        SET coins = coins - ?
+        WHERE telegram_id = ?
+          AND coins >= ?
+        """,
+        (coins, user_id, coins)
+    )
+
+    if cursor.rowcount != 1:
+        conn.rollback()
+        conn.close()
+
+        await query.message.reply_text(
+            "❌ Withdrawal Request তৈরি করা যায়নি।"
+        )
+        return
+
+    cursor.execute(
+        """
+        INSERT INTO withdrawals
+        (
+            telegram_id,
+            coins,
+            method,
+            payment_number,
+            comment,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, 'Pending')
+        """,
+        (
+            user_id,
+            coins,
+            method,
+            number,
+            comment
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    # পুরোনো withdrawal data পরিষ্কার
+    context.user_data.pop(
+        "withdraw_coins",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_method",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_number",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_comment",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_step",
+        None
+    )
+
+    await query.message.reply_text(
+        "✅ Withdrawal Request পাঠানো হয়েছে!\n\n"
+        f"🪙 Coins: {coins}\n"
+        "📌 Status: Pending\n\n"
+        "Admin আপনার Payment যাচাই করে "
+        "পেমেন্ট করবেন।"
+    )
+
+
+# ==============================
+# CANCEL WITHDRAWAL
+# ==============================
+
+async def cancel_withdraw(update, context):
+
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data.pop(
+        "withdraw_coins",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_method",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_number",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_comment",
+        None
+    )
+
+    context.user_data.pop(
+        "withdraw_step",
+        None
+    )
+
+    await query.message.reply_text(
+        "❌ Withdrawal Request বাতিল করা হয়েছে।"
+    )
+    # ==============================
+# INCOME
+# ==============================
+
+async def income(update, context):
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text(
+        "💰 অনলাইনে ইনকামের কিছু মাধ্যম:\n\n"
+        "1️⃣ Freelancing\n"
+        "2️⃣ Affiliate Marketing\n"
+        "3️⃣ Micro Tasks\n"
+        "4️⃣ Content Creation\n"
+        "5️⃣ Digital Products\n\n"
+        "⚠️ কোনো মাধ্যমেই আয়ের নিশ্চয়তা নেই।"
+    )
+
+
+# ==============================
+# AFFILIATE OFFERS
+# ==============================
+
+async def offers(update, context):
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text(
+        "🎁 Affiliate Offers\n\n"
+        "Affiliate Offers সিস্টেম পরবর্তী ধাপে যুক্ত করা যাবে।"
+    )
+
+
+# ==============================
+# ADS
+# ==============================
+
+async def ads(update, context):
+
+    query = update.callback_query
+    await query.answer()
+
+    await query.message.reply_text(
+        "📢 Ads / Direct Link\n\n"
+        "Advertisement সিস্টেম পরবর্তী ধাপে যুক্ত করা যাবে।"
+    )
+
+
+# ==============================
+# BUTTON HANDLER
+# ==============================
+
+async def button_handler(update, context):
+
+    query = update.callback_query
+
+    if query.data == "coins":
+
+        await show_coins(update, context)
+
+    elif query.data == "referral":
+
+        await show_referral(update, context)
+
+    elif query.data == "withdraw":
+
+        await start_withdraw(update, context)
+
+    elif query.data in (
+        "withdraw_bkash",
+        "withdraw_nagad",
+        "withdraw_rocket"
+    ):
+
+        await choose_withdraw_method(
+            update,
+            context
+        )
+
+    elif query.data == "confirm_withdraw":
+
+        await confirm_withdraw(
+            update,
+            context
+        )
+
+    elif query.data == "cancel_withdraw":
+
+        await cancel_withdraw(
+            update,
+            context
+        )
+
+    elif query.data == "income":
+
+        await income(update, context)
+
+    elif query.data == "offers":
+
+        await offers(update, context)
+
+    elif query.data == "ads":
+
+        await ads(update, context)
+
+    elif query.data == "ai":
+
+        await query.answer()
+
+        await query.message.reply_text(
+            "🤖 আপনার প্রশ্নটি লিখুন।"
+        )
+
+    else:
+
+        await query.answer()
+
+
+# ==============================
+# MESSAGE HANDLER
+# ==============================
+
+async def message_handler(update, context):
+
+    step = context.user_data.get(
+        "withdraw_step"
+    )
+
+    if step == "coins":
+
+        await process_withdraw(
+            update,
+            context
+        )
+
+        return
+
+    if step == "number":
+
+        await process_withdraw_number(
+            update,
+            context
+        )
+
+        return
+
+    if step == "comment":
+
+        await process_withdraw_comment(
+            update,
+            context
+        )
+
+        return
+
+    text = update.message.text
+
+    await update.message.reply_text(
+        "🤖 আপনার প্রশ্ন পেয়েছি।\n\n"
+        f"প্রশ্ন: {text}\n\n"
+        "AI সিস্টেম পরবর্তী ধাপে যুক্ত করা হবে।"
+    )
+
+
+# ==============================
+# MAIN
+# ==============================
+
+def main():
+
+    if not BOT_TOKEN:
+
+        raise ValueError(
+            "BOT_TOKEN সেট করা হয়নি।"
+        )
+
+    threading.Thread(
+        target=run_web_server,
+        daemon=True
+    ).start()
+
+    app = (
+        Application
+        .builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            button_handler
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_handler
+        )
+    )
+
+    print(
+        "EarnMate AI Bot + Admin Panel is running..."
+    )
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+
+    main()
